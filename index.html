@@ -1,0 +1,291 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Micro:bit 3D Scanner</title>
+
+<style>
+body {
+  margin: 0;
+  background: #101827;
+  color: white;
+  font-family: Arial, sans-serif;
+  text-align: center;
+}
+header { padding: 14px; }
+button {
+  background: #168bce;
+  color: white;
+  border: 0;
+  border-radius: 9px;
+  padding: 13px;
+  margin: 5px;
+  font-size: 15px;
+}
+#viewer {
+  width: 100%;
+  height: 55vh;
+  display: block;
+}
+.stats {
+  display: flex;
+  justify-content: space-around;
+  padding: 12px 4px;
+}
+.stat {
+  background: #202d42;
+  border-radius: 10px;
+  padding: 12px 8px;
+  width: 42%;
+}
+.value {
+  font-size: 25px;
+  color: #39e6a1;
+  margin-top: 8px;
+}
+#status { color: #ffc857; padding: 8px; }
+</style>
+</head>
+
+<body>
+<header>
+<h2>Micro:bit 3D Scanner</h2>
+<div id="status">Disconnected</div>
+
+<button onclick="connectBLE()">Connect micro:bit</button>
+<button onclick="clearMap()">Clear map</button>
+<button onclick="disconnectBLE()">Disconnect</button>
+</header>
+
+<div class="stats">
+  <div class="stat">
+    Servo angle
+    <div class="value" id="angle">--°</div>
+  </div>
+  <div class="stat">
+    Distance
+    <div class="value" id="distance">-- cm</div>
+  </div>
+</div>
+
+<div id="viewer"></div>
+<p>Drag to rotate · Pinch to zoom</p>
+
+<script type="module">
+import * as THREE from
+'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js';
+
+import { OrbitControls } from
+'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js';
+
+// Bluetooth UART UUIDs
+const UART_SERVICE =
+'6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+
+const UART_TX =
+'6e400003-b5a3-f393-e0a9-e50e24dcca9e';
+
+let device;
+let characteristic;
+let buffer = '';
+
+const status = document.getElementById('status');
+
+// 3D scene
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x101827);
+
+const camera = new THREE.PerspectiveCamera(
+  60, window.innerWidth / (window.innerHeight * 0.55),
+  0.1, 1000
+);
+
+camera.position.set(0, 180, 300);
+
+const renderer = new THREE.WebGLRenderer({
+  antialias: true
+});
+
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.setSize(window.innerWidth, window.innerHeight * 0.55);
+
+document.getElementById('viewer').appendChild(
+  renderer.domElement
+);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+
+scene.add(new THREE.GridHelper(400, 20, 0x456080, 0x29394f));
+
+scene.add(new THREE.AxesHelper(70));
+
+// Scanner origin
+const origin = new THREE.Mesh(
+  new THREE.SphereGeometry(4),
+  new THREE.MeshBasicMaterial({color: 0xffffff})
+);
+scene.add(origin);
+
+// Point cloud
+const positions = [];
+const colors = [];
+
+const geometry = new THREE.BufferGeometry();
+
+const material = new THREE.PointsMaterial({
+  size: 3,
+  vertexColors: true
+});
+
+const pointCloud = new THREE.Points(geometry, material);
+scene.add(pointCloud);
+
+// Receive angle,distance data
+function handleData(event) {
+  const decoder = new TextDecoder();
+  buffer += decoder.decode(event.target.value, {stream:true});
+
+  const lines = buffer.split('\n');
+  buffer = lines.pop();
+
+  for (const line of lines) {
+    const parts = line.trim().split(',');
+    if (parts.length !== 2) continue;
+
+    const angle = Number(parts[0]);
+    const distance = Number(parts[1]);
+
+    if (!Number.isFinite(angle) ||
+        !Number.isFinite(distance) ||
+        distance < 3 || distance > 300) continue;
+
+    document.getElementById('angle').textContent =
+      angle + '°';
+
+    document.getElementById('distance').textContent =
+      distance + ' cm';
+
+    // Convert polar measurement to coordinates.
+    // This creates a vertical 2D scanning plane.
+    const theta = (angle - 90) * Math.PI / 180;
+
+    const x = distance * Math.sin(theta);
+    const y = 2;
+    const z = distance * Math.cos(theta);
+
+    positions.push(x, y, z);
+
+    // Distance-based colours
+    let color;
+    if (distance < 50) {
+      color = new THREE.Color(0x39e66b);
+    } else if (distance < 150) {
+      color = new THREE.Color(0xffd43b);
+    } else {
+      color = new THREE.Color(0xff5252);
+    }
+
+    colors.push(color.r, color.g, color.b);
+
+    geometry.setAttribute(
+      'position',
+      new THREE.Float32BufferAttribute(positions, 3)
+    );
+
+    geometry.setAttribute(
+      'color',
+      new THREE.Float32BufferAttribute(colors, 3)
+    );
+
+    geometry.computeBoundingSphere();
+  }
+}
+
+// Bluetooth connection
+window.connectBLE = async function() {
+  try {
+    status.textContent = 'Searching for micro:bit...';
+
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{services: [UART_SERVICE]}]
+    });
+
+    device.addEventListener(
+      'gattserverdisconnected',
+      () => {
+        status.textContent = 'Disconnected';
+      }
+    );
+
+    const server = await device.gatt.connect();
+
+    const service = await server.getPrimaryService(
+      UART_SERVICE
+    );
+
+    characteristic = await service.getCharacteristic(
+      UART_TX
+    );
+
+    await characteristic.startNotifications();
+
+    characteristic.addEventListener(
+      'characteristicvaluechanged',
+      handleData
+    );
+
+    status.textContent = 'Connected to ' + device.name;
+
+  } catch (error) {
+    status.textContent = 'Error: ' + error.message;
+  }
+};
+
+// Clear point cloud
+window.clearMap = function() {
+  positions.length = 0;
+  colors.length = 0;
+  geometry.setAttribute(
+    'position',
+    new THREE.Float32BufferAttribute([], 3)
+  );
+  geometry.setAttribute(
+    'color',
+    new THREE.Float32BufferAttribute([], 3)
+  );
+};
+
+// Disconnect
+window.disconnectBLE = function() {
+  if (device && device.gatt.connected) {
+    device.gatt.disconnect();
+  }
+  status.textContent = 'Disconnected';
+};
+
+// Responsive display
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth /
+    (window.innerHeight * 0.55);
+  camera.updateProjectionMatrix();
+
+  renderer.setSize(
+    window.innerWidth,
+    window.innerHeight * 0.55
+  );
+});
+
+// Animation
+function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+  renderer.render(scene, camera);
+}
+
+animate();
+</script>
+</body>
+</html>
